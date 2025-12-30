@@ -269,3 +269,122 @@ function createDefaultEstimate(
         totalDays: Math.ceil((nodes.length * 5) / 2)
     };
 }
+
+export interface ExtractedNode {
+    title: string;
+    description: string;
+    icon: string;
+    color: string;
+    order: number;
+}
+
+export interface TopicConversionResult {
+    nodes: ExtractedNode[];
+    edges: Array<{ from: number; to: number }>;
+    summary: string;
+}
+
+export async function extractNodesFromTopic(
+    topicTitle: string,
+    topicDescription: string | null
+): Promise<TopicConversionResult> {
+    try {
+        const completion = await getGroqClient().chat.completions.create({
+            messages: [
+                {
+                    role: 'system',
+                    content: `Kamu adalah ahli kurikulum dan desainer pembelajaran. Tugas kamu adalah menganalisis topik pembelajaran dan mengekstrak pokok-pokok bahasan yang akan menjadi node dalam learning path.
+
+Untuk setiap topik, identifikasi:
+1. Sub-topik atau konsep utama yang perlu dipelajari
+2. Urutan logis pembelajaran (dari dasar ke lanjutan)
+3. Koneksi antar konsep (prerequisite)
+
+Aturan:
+- Ekstrak 3-8 node (terlalu sedikit tidak detail, terlalu banyak membingungkan)
+- Setiap node harus spesifik dan actionable
+- Urutkan dari konsep dasar ke lanjutan
+- Berikan icon emoji yang relevan
+- Berikan warna dalam format hex yang sesuai dengan tema
+
+Jawab HANYA dalam format JSON:
+{
+  "nodes": [
+    {
+      "title": "Judul Node",
+      "description": "Penjelasan singkat apa yang dipelajari di node ini",
+      "icon": "📚",
+      "color": "#6366f1",
+      "order": 0
+    }
+  ],
+  "edges": [
+    {"from": 0, "to": 1},
+    {"from": 1, "to": 2}
+  ],
+  "summary": "Ringkasan singkat learning path"
+}`
+                },
+                {
+                    role: 'user',
+                    content: `Ekstrak pokok-pokok bahasan dari topik berikut:
+
+Judul: ${topicTitle}
+${topicDescription ? `Deskripsi: ${topicDescription}` : ''}
+
+Buatkan learning path yang terstruktur dengan node-node pembelajaran yang saling terhubung.`
+                }
+            ],
+            model: 'llama-3.3-70b-versatile',
+            temperature: 0.5,
+            max_tokens: 2000
+        });
+
+        const responseText = completion.choices[0]?.message?.content || '';
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+
+        if (!jsonMatch) {
+            return createDefaultTopicConversion(topicTitle);
+        }
+
+        const result = JSON.parse(jsonMatch[0]) as TopicConversionResult;
+        return result;
+
+    } catch (error) {
+        console.error('Topic conversion error:', error);
+        return createDefaultTopicConversion(topicTitle);
+    }
+}
+
+function createDefaultTopicConversion(topicTitle: string): TopicConversionResult {
+    return {
+        nodes: [
+            {
+                title: `Pengenalan ${topicTitle}`,
+                description: `Memahami konsep dasar ${topicTitle}`,
+                icon: '📚',
+                color: '#6366f1',
+                order: 0
+            },
+            {
+                title: `Praktik ${topicTitle}`,
+                description: `Latihan dan implementasi ${topicTitle}`,
+                icon: '💻',
+                color: '#8b5cf6',
+                order: 1
+            },
+            {
+                title: `Pendalaman ${topicTitle}`,
+                description: `Konsep lanjutan dan best practices`,
+                icon: '🚀',
+                color: '#ec4899',
+                order: 2
+            }
+        ],
+        edges: [
+            { from: 0, to: 1 },
+            { from: 1, to: 2 }
+        ],
+        summary: `Learning path untuk mempelajari ${topicTitle} dari dasar hingga lanjutan`
+    };
+}

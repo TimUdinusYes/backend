@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { getSupabase } from '../lib/supabase.js';
+import { extractNodesFromTopic, validateLearningPath } from '../services/aiValidation.js';
 
 export const workflowRouter = Router();
 
@@ -12,7 +13,7 @@ workflowRouter.get('/workflows', async (req: Request, res: Response) => {
             .from('workflows')
             .select(`
                 *,
-                topics (id, title)
+                topics:topic_id (id, title)
             `)
             .eq('is_public', true)
             .eq('is_draft', false)  // Exclude drafts from public listings
@@ -58,7 +59,7 @@ workflowRouter.get('/workflows/mine', async (req: Request, res: Response) => {
             .from('workflows')
             .select(`
                 *,
-                topics (id, title)
+                topics:topic_id (id, title)
             `)
             .eq('user_id', userId)
             .order('updated_at', { ascending: false });
@@ -89,7 +90,7 @@ workflowRouter.get('/workflows/drafts', async (req: Request, res: Response) => {
             .from('workflows')
             .select(`
                 *,
-                topics (id, title)
+                topics:topic_id (id, title)
             `)
             .eq('user_id', userId)
             .eq('is_draft', true)
@@ -117,7 +118,7 @@ workflowRouter.get('/workflows/:id', async (req: Request, res: Response) => {
             .from('workflows')
             .select(`
                 *,
-                topics (id, title)
+                topics:topic_id (id, title)
             `)
             .eq('id', id)
             .single();
@@ -384,26 +385,74 @@ workflowRouter.post('/workflows/:id/fork', async (req: Request, res: Response) =
             return;
         }
 
-        // Copy edges
+        // Copy edges with validation_reason (generate if null)
         const { data: originalEdges } = await getSupabase()
             .from('workflow_edges')
-            .select('*')
+            .select(`
+                *,
+                source_node:source_node_id (*),
+                target_node:target_node_id (*)
+            `)
             .eq('workflow_id', id);
 
         if (originalEdges && originalEdges.length > 0) {
-            const newEdges = originalEdges.map(e => ({
-                workflow_id: forked.id,
-                source_node_id: e.source_node_id,
-                target_node_id: e.target_node_id,
-                validation_reason: e.validation_reason
-            }));
+            const newEdges = await Promise.all(
+                originalEdges.map(async (e) => {
+                    let validationReason = e.validation_reason;
+
+                    // Generate validation_reason if null (for old workflows)
+                    if (!validationReason) {
+                        const sourceNode = e.source_node as any;
+                        const targetNode = e.target_node as any;
+
+                        console.log('🤖 Generating validation_reason for:', sourceNode?.title, '->', targetNode?.title);
+                        const validation = await validateLearningPath(sourceNode?.title, targetNode?.title);
+                        validationReason = validation.reason;
+
+                        // Update original workflow edge with validation_reason (backfill)
+                        await getSupabase()
+                            .from('workflow_edges')
+                            .update({ validation_reason: validationReason })
+                            .eq('id', e.id);
+                    }
+
+                    return {
+                        workflow_id: forked.id,
+                        source_node_id: e.source_node_id,
+                        target_node_id: e.target_node_id,
+                        validation_reason: validationReason
+                    };
+                })
+            );
 
             await getSupabase()
                 .from('workflow_edges')
                 .insert(newEdges);
         }
 
-        res.json({ success: true, data: forked });
+        // Fetch complete forked workflow with edges
+        const { data: edges } = await getSupabase()
+            .from('workflow_edges')
+            .select(`
+                *,
+                source_node:source_node_id (*),
+                target_node:target_node_id (*)
+            `)
+            .eq('workflow_id', forked.id);
+
+        console.log('📤 Sending forked workflow with edges:', edges?.map(e => ({
+            source: (e.source_node as any)?.title,
+            target: (e.target_node as any)?.title,
+            validation_reason: e.validation_reason
+        })));
+
+        res.json({
+            success: true,
+            data: {
+                ...forked,
+                edges: edges || []
+            }
+        });
     } catch (error) {
         console.error('Fork workflow error:', error);
         res.status(500).json({ success: false, error: 'Failed to fork workflow' });
@@ -429,5 +478,184 @@ workflowRouter.delete('/workflows/:id', async (req: Request, res: Response) => {
     } catch (error) {
         console.error('Delete workflow error:', error);
         res.status(500).json({ success: false, error: 'Failed to delete workflow' });
+    }
+});
+
+// Convert topic to workflow with AI
+workflowRouter.post('/topics/:topicId/convert-to-workflow', async (req: Request, res: Response) => {
+    try {
+        const { topicId } = req.params;
+        const userId = req.headers['x-user-id'] as string || req.body.user_id;
+
+        if (!userId) {
+            res.status(401).json({ success: false, error: 'User ID required' });
+            return;
+        }
+
+        // Get topic details
+        const { data: topic, error: topicError } = await getSupabase()
+            .from('topics')
+            .select('*')
+            .eq('id', topicId)
+            .single();
+
+        if (topicError || !topic) {
+            res.status(404).json({ success: false, error: 'Topic not found' });
+            return;
+        }
+
+        // Check if already converted
+        if (topic.is_converted && topic.converted_workflow_id) {
+            // Get existing workflow
+            const { data: existingWorkflow, error: workflowError } = await getSupabase()
+                .from('workflows')
+                .select(`
+                    *,
+                    topics:topic_id (id, title)
+                `)
+                .eq('id', topic.converted_workflow_id)
+                .single();
+
+            if (!workflowError && existingWorkflow) {
+                // Get edges
+                const { data: edges } = await getSupabase()
+                    .from('workflow_edges')
+                    .select(`
+                        *,
+                        source_node:source_node_id (*),
+                        target_node:target_node_id (*)
+                    `)
+                    .eq('workflow_id', existingWorkflow.id);
+
+                console.log('📤 Sending cached converted workflow with edges:', edges?.map(e => ({
+                    source: (e.source_node as any)?.title,
+                    target: (e.target_node as any)?.title,
+                    validation_reason: e.validation_reason
+                })));
+
+                res.json({
+                    success: true,
+                    fromCache: true,
+                    data: {
+                        ...existingWorkflow,
+                        edges: edges || []
+                    }
+                });
+                return;
+            }
+        }
+
+        // AI conversion
+        const conversionResult = await extractNodesFromTopic(topic.title, topic.description);
+
+        // Create nodes in database
+        const nodeData = conversionResult.nodes.map(node => ({
+            topic_id: parseInt(topicId),
+            title: node.title,
+            description: node.description,
+            icon: node.icon,
+            color: node.color,
+            created_by: userId
+        }));
+
+        const { data: createdNodes, error: nodesError } = await getSupabase()
+            .from('learning_nodes')
+            .insert(nodeData)
+            .select();
+
+        if (nodesError || !createdNodes) {
+            res.status(500).json({ success: false, error: 'Failed to create nodes' });
+            return;
+        }
+
+        // Calculate node positions for auto-layout (vertical flow)
+        const nodePositions: Record<string, { x: number; y: number }> = {};
+        createdNodes.forEach((node, index) => {
+            nodePositions[node.id] = {
+                x: 250,
+                y: index * 150 + 100
+            };
+        });
+
+        // Create workflow
+        const { data: workflow, error: workflowError } = await getSupabase()
+            .from('workflows')
+            .insert({
+                user_id: userId,
+                topic_id: parseInt(topicId),
+                title: `Learning Path: ${topic.title}`,
+                description: conversionResult.summary,
+                is_public: false,
+                node_positions: nodePositions
+            })
+            .select()
+            .single();
+
+        if (workflowError || !workflow) {
+            res.status(500).json({ success: false, error: 'Failed to create workflow' });
+            return;
+        }
+
+        // Create edges based on AI suggestion with proper validation reasons
+        if (conversionResult.edges && conversionResult.edges.length > 0) {
+            const edgeData = await Promise.all(
+                conversionResult.edges.map(async (edge) => {
+                    const sourceNode = createdNodes[edge.from];
+                    const targetNode = createdNodes[edge.to];
+
+                    // Generate validation reason for this specific edge
+                    const validation = await validateLearningPath(sourceNode.title, targetNode.title);
+
+                    return {
+                        workflow_id: workflow.id,
+                        source_node_id: sourceNode.id,
+                        target_node_id: targetNode.id,
+                        validation_reason: validation.reason
+                    };
+                })
+            );
+
+            await getSupabase()
+                .from('workflow_edges')
+                .insert(edgeData);
+        }
+
+        // Update topic as converted
+        await getSupabase()
+            .from('topics')
+            .update({
+                is_converted: true,
+                converted_workflow_id: workflow.id
+            })
+            .eq('id', topicId);
+
+        // Fetch complete workflow with edges
+        const { data: edges } = await getSupabase()
+            .from('workflow_edges')
+            .select(`
+                *,
+                source_node:source_node_id (*),
+                target_node:target_node_id (*)
+            `)
+            .eq('workflow_id', workflow.id);
+
+        console.log('📤 Sending converted workflow with edges:', edges?.map(e => ({
+            source: (e.source_node as any)?.title,
+            target: (e.target_node as any)?.title,
+            validation_reason: e.validation_reason
+        })));
+
+        res.json({
+            success: true,
+            fromCache: false,
+            data: {
+                ...workflow,
+                edges: edges || [],
+                topics: { id: topic.id, title: topic.title }
+            }
+        });
+    } catch (error) {
+        console.error('Convert topic error:', error);
+        res.status(500).json({ success: false, error: 'Failed to convert topic' });
     }
 });
