@@ -138,6 +138,31 @@ workflowRouter.get('/workflows/:id', async (req: Request, res: Response) => {
       `)
             .eq('workflow_id', id);
 
+        // Enrich edges with validation data from cache
+        const enrichedEdges = await Promise.all((edges || []).map(async (edge) => {
+            const sourceNode = edge.source_node as any;
+            const targetNode = edge.target_node as any;
+
+            if (sourceNode?.title && targetNode?.title) {
+                const { data: validation } = await getSupabase()
+                    .from('node_pair_validations')
+                    .select('is_valid, validation_reason, recommendation')
+                    .eq('source_name', sourceNode.title)
+                    .eq('target_name', targetNode.title)
+                    .single();
+
+                if (validation) {
+                    return {
+                        ...edge,
+                        is_valid: validation.is_valid,
+                        validation_reason: validation.validation_reason,
+                        recommendation: validation.recommendation
+                    };
+                }
+            }
+            return edge;
+        }));
+
         // Check if user has starred
         let hasStarred = false;
         if (userId) {
@@ -154,7 +179,7 @@ workflowRouter.get('/workflows/:id', async (req: Request, res: Response) => {
             success: true,
             data: {
                 ...workflow,
-                edges: edges || [],
+                edges: enrichedEdges,
                 hasStarred,
                 isOwner: workflow.user_id === userId
             }
@@ -198,13 +223,12 @@ workflowRouter.post('/workflows', async (req: Request, res: Response) => {
             return;
         }
 
-        // Create edges if provided
+        // Create edges if provided (validation data is now in cache)
         if (edges && edges.length > 0) {
-            const edgeData = edges.map((e: { source_node_id: string; target_node_id: string; validation_reason?: string }) => ({
+            const edgeData = edges.map((e: { source_node_id: string; target_node_id: string }) => ({
                 workflow_id: workflow.id,
                 source_node_id: e.source_node_id,
-                target_node_id: e.target_node_id,
-                validation_reason: e.validation_reason || null
+                target_node_id: e.target_node_id
             }));
 
             await getSupabase()
@@ -251,11 +275,10 @@ workflowRouter.put('/workflows/:id', async (req: Request, res: Response) => {
                 .eq('workflow_id', id);
 
             if (edges.length > 0) {
-                const edgeData = edges.map((e: { source_node_id: string; target_node_id: string; validation_reason?: string }) => ({
+                const edgeData = edges.map((e: { source_node_id: string; target_node_id: string }) => ({
                     workflow_id: id,
                     source_node_id: e.source_node_id,
-                    target_node_id: e.target_node_id,
-                    validation_reason: e.validation_reason || null
+                    target_node_id: e.target_node_id
                 }));
 
                 await getSupabase()
@@ -385,52 +408,25 @@ workflowRouter.post('/workflows/:id/fork', async (req: Request, res: Response) =
             return;
         }
 
-        // Copy edges with validation_reason (generate if null)
+        // Copy edges (validation data is now from cache on GET)
         const { data: originalEdges } = await getSupabase()
             .from('workflow_edges')
-            .select(`
-                *,
-                source_node:source_node_id (*),
-                target_node:target_node_id (*)
-            `)
+            .select('source_node_id, target_node_id')
             .eq('workflow_id', id);
 
         if (originalEdges && originalEdges.length > 0) {
-            const newEdges = await Promise.all(
-                originalEdges.map(async (e) => {
-                    let validationReason = e.validation_reason;
-
-                    // Generate validation_reason if null (for old workflows)
-                    if (!validationReason) {
-                        const sourceNode = e.source_node as any;
-                        const targetNode = e.target_node as any;
-
-                        console.log('🤖 Generating validation_reason for:', sourceNode?.title, '->', targetNode?.title);
-                        const validation = await validateLearningPath(sourceNode?.title, targetNode?.title);
-                        validationReason = validation.reason;
-
-                        // Update original workflow edge with validation_reason (backfill)
-                        await getSupabase()
-                            .from('workflow_edges')
-                            .update({ validation_reason: validationReason })
-                            .eq('id', e.id);
-                    }
-
-                    return {
-                        workflow_id: forked.id,
-                        source_node_id: e.source_node_id,
-                        target_node_id: e.target_node_id,
-                        validation_reason: validationReason
-                    };
-                })
-            );
+            const newEdges = originalEdges.map(e => ({
+                workflow_id: forked.id,
+                source_node_id: e.source_node_id,
+                target_node_id: e.target_node_id
+            }));
 
             await getSupabase()
                 .from('workflow_edges')
                 .insert(newEdges);
         }
 
-        // Fetch complete forked workflow with edges
+        // Fetch complete forked workflow with edges (validation will be enriched on GET)
         const { data: edges } = await getSupabase()
             .from('workflow_edges')
             .select(`
@@ -440,11 +436,7 @@ workflowRouter.post('/workflows/:id/fork', async (req: Request, res: Response) =
             `)
             .eq('workflow_id', forked.id);
 
-        console.log('📤 Sending forked workflow with edges:', edges?.map(e => ({
-            source: (e.source_node as any)?.title,
-            target: (e.target_node as any)?.title,
-            validation_reason: e.validation_reason
-        })));
+        console.log('📤 Forked workflow with', edges?.length || 0, 'edges');
 
         res.json({
             success: true,
@@ -596,21 +588,46 @@ workflowRouter.post('/topics/:topicId/convert-to-workflow', async (req: Request,
             return;
         }
 
-        // Create edges based on AI suggestion with proper validation reasons
+        // Create edges and save validation to cache by NAME
         if (conversionResult.edges && conversionResult.edges.length > 0) {
             const edgeData = await Promise.all(
                 conversionResult.edges.map(async (edge) => {
                     const sourceNode = createdNodes[edge.from];
                     const targetNode = createdNodes[edge.to];
 
-                    // Generate validation reason for this specific edge
-                    const validation = await validateLearningPath(sourceNode.title, targetNode.title);
+                    // Check cache by NAME first
+                    const { data: cachedValidation } = await getSupabase()
+                        .from('node_pair_validations')
+                        .select('is_valid, validation_reason, recommendation')
+                        .eq('source_name', sourceNode.title)
+                        .eq('target_name', targetNode.title)
+                        .single();
 
+                    if (!cachedValidation) {
+                        // Generate validation and save to cache by NAME
+                        console.log('🤖 Generating validation for:', sourceNode.title, '->', targetNode.title);
+                        const validation = await validateLearningPath(sourceNode.title, targetNode.title);
+
+                        await getSupabase()
+                            .from('node_pair_validations')
+                            .upsert({
+                                source_name: sourceNode.title,
+                                target_name: targetNode.title,
+                                is_valid: validation.isValid,
+                                validation_reason: validation.reason,
+                                recommendation: validation.recommendation || null
+                            }, {
+                                onConflict: 'source_name,target_name'
+                            });
+                    } else {
+                        console.log('✅ Using cached validation for:', sourceNode.title, '->', targetNode.title);
+                    }
+
+                    // Edge only contains references (validation from cache on GET)
                     return {
                         workflow_id: workflow.id,
                         source_node_id: sourceNode.id,
-                        target_node_id: targetNode.id,
-                        validation_reason: validation.reason
+                        target_node_id: targetNode.id
                     };
                 })
             );

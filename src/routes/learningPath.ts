@@ -46,7 +46,7 @@ function saveToCache(fromNode: string, toNode: string, result: any) {
 
 learningPathRouter.post('/validate-path', async (req: Request, res: Response) => {
     try {
-        const { from_node, to_node, user_id, source_node_id, target_node_id } = req.body as ValidatePathBody;
+        const { from_node, to_node } = req.body as ValidatePathBody;
 
         if (!from_node || !to_node) {
             res.status(400).json({
@@ -56,34 +56,34 @@ learningPathRouter.post('/validate-path', async (req: Request, res: Response) =>
             return;
         }
 
-        // 1. Check if validation_reason already exists in workflow_edges (priority tertinggi)
-        if (source_node_id && target_node_id) {
-            // Cari di workflow_edges untuk kombinasi node ini (dari workflow manapun)
-            // Karena validasi node A -> node B seharusnya konsisten across workflows
-            const { data: existingEdges } = await getSupabase()
-                .from('workflow_edges')
-                .select('validation_reason, workflow_id')
-                .eq('source_node_id', source_node_id)
-                .eq('target_node_id', target_node_id)
-                .not('validation_reason', 'is', null)
-                .limit(1);
+        // Normalize names for consistent lookup
+        const sourceName = from_node.trim();
+        const targetName = to_node.trim();
 
-            if (existingEdges && existingEdges.length > 0 && existingEdges[0].validation_reason) {
-                console.log('✅ Validation reason found in workflow_edges (from any workflow):', from_node, '->', to_node);
-                res.json({
-                    success: true,
-                    isValid: true,
-                    reason: existingEdges[0].validation_reason,
-                    fromDatabase: true
-                });
-                return;
-            }
+        // 1. Check node_pair_validations cache by NAME (works across all topics!)
+        const { data: cachedValidation } = await getSupabase()
+            .from('node_pair_validations')
+            .select('is_valid, validation_reason, recommendation')
+            .eq('source_name', sourceName)
+            .eq('target_name', targetName)
+            .single();
+
+        if (cachedValidation) {
+            console.log('✅ Validation found in DB cache:', sourceName, '->', targetName, 'is_valid:', cachedValidation.is_valid);
+            res.json({
+                success: true,
+                isValid: cachedValidation.is_valid,
+                reason: cachedValidation.validation_reason,
+                recommendation: cachedValidation.recommendation,
+                fromDatabase: true
+            });
+            return;
         }
 
-        // 2. Check cache
-        const cachedResult = getFromCache(from_node, to_node);
+        // 2. Check in-memory cache
+        const cachedResult = getFromCache(sourceName, targetName);
         if (cachedResult) {
-            console.log('✅ Cache hit for:', from_node, '->', to_node);
+            console.log('✅ In-memory cache hit for:', sourceName, '->', targetName);
             res.json({
                 ...cachedResult,
                 fromCache: true
@@ -92,45 +92,39 @@ learningPathRouter.post('/validate-path', async (req: Request, res: Response) =>
         }
 
         // 3. Call AI if not found anywhere
-        console.log('🔄 Cache miss, calling AI for:', from_node, '->', to_node);
-        const validation = await validateLearningPath(from_node, to_node);
+        console.log('🔄 Cache miss, calling AI for:', sourceName, '->', targetName);
+        const validation = await validateLearningPath(sourceName, targetName);
 
-        // Prepare response
-        let response;
-        if (validation.isValid) {
-            if (user_id) {
-                const { error: dbError } = await getSupabase()
-                    .from('user_learning_paths')
-                    .insert({
-                        user_id,
-                        from_node,
-                        to_node,
-                        is_valid: true,
-                        validation_reason: validation.reason
-                    });
+        // 4. Save to node_pair_validations by NAME
+        const { error: dbError } = await getSupabase()
+            .from('node_pair_validations')
+            .upsert({
+                source_name: sourceName,
+                target_name: targetName,
+                is_valid: validation.isValid,
+                validation_reason: validation.reason,
+                recommendation: validation.recommendation || null
+            }, {
+                onConflict: 'source_name,target_name'
+            });
 
-                if (dbError) {
-                    console.error('Database insert error:', dbError);
-                }
-            }
-
-            response = {
-                success: true,
-                isValid: true,
-                reason: validation.reason,
-                saved: !!user_id
-            };
+        if (dbError) {
+            console.error('Database insert error:', dbError);
         } else {
-            response = {
-                success: true,
-                isValid: false,
-                reason: validation.reason,
-                recommendation: validation.recommendation
-            };
+            console.log('💾 Saved validation to DB:', sourceName, '->', targetName);
         }
 
-        // Save to cache
-        saveToCache(from_node, to_node, response);
+        // Prepare response
+        const response = {
+            success: true,
+            isValid: validation.isValid,
+            reason: validation.reason,
+            recommendation: validation.recommendation,
+            saved: true
+        };
+
+        // Save to in-memory cache
+        saveToCache(sourceName, targetName, response);
 
         res.json(response);
 

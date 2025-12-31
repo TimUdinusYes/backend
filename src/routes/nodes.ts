@@ -30,7 +30,7 @@ nodeRouter.get('/nodes/:topicId', async (req: Request, res: Response) => {
 // Create new node with AI duplicate check
 nodeRouter.post('/nodes', async (req: Request, res: Response) => {
     try {
-        const { topic_id, title, description, icon, color, user_id } = req.body;
+        const { topic_id, title, description, color, user_id } = req.body;
 
         if (!topic_id || !title) {
             res.status(400).json({
@@ -61,14 +61,13 @@ nodeRouter.post('/nodes', async (req: Request, res: Response) => {
             }
         }
 
-        // Create the node
+        // Create the node (no icon field anymore)
         const { data, error } = await getSupabase()
             .from('learning_nodes')
             .insert({
                 topic_id,
                 title,
                 description: description || null,
-                icon: icon || '📚',
                 color: color || '#6366f1',
                 created_by: user_id || null
             })
