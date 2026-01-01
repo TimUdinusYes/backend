@@ -545,7 +545,6 @@ workflowRouter.post('/topics/:topicId/convert-to-workflow', async (req: Request,
             topic_id: parseInt(topicId),
             title: node.title,
             description: node.description,
-            icon: node.icon,
             color: node.color,
             created_by: userId
         }));
