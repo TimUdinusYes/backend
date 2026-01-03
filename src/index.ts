@@ -8,6 +8,7 @@ import { learningPathRouter } from './routes/learningPath.js';
 import { nodeRouter } from './routes/nodes.js';
 import { workflowRouter } from './routes/workflows.js';
 import { implementRouter } from './routes/implement.js';
+import { quizRouter } from './routes/quiz.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -27,6 +28,7 @@ app.use('/api', learningPathRouter);
 app.use('/api', nodeRouter);
 app.use('/api', workflowRouter);
 app.use('/api', implementRouter);
+app.use('/api', quizRouter);
 
 app.listen(PORT, () => {
     console.log(`🚀 Backend server running on http://localhost:${PORT}`);
