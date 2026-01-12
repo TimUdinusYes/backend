@@ -77,15 +77,19 @@ implementRouter.post('/estimate-nodes', async (req: Request, res: Response) => {
 implementRouter.post('/workflows/:id/implement', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { supabase_token, start_date, daily_hours } = req.body;
+        const { access_token, start_date, daily_hours } = req.body;
 
-        if (!supabase_token) {
-            res.status(400).json({ success: false, error: 'Supabase access token required' });
+        if (!access_token) {
+            res.status(400).json({ success: false, error: 'Google access token required' });
             return;
         }
 
-        // Get Google access token from Supabase session
-        const googleAccessToken = await getGoogleAccessToken(supabase_token);
+        console.log('Received request to create calendar events');
+        console.log('Workflow ID:', id);
+        console.log('Start date:', start_date);
+        console.log('Daily hours:', daily_hours);
+
+        const googleAccessToken = access_token;
 
         // Get workflow edges with node data
         const { data: edges } = await getSupabase()
