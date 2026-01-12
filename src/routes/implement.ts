@@ -70,26 +70,44 @@ implementRouter.post('/estimate-nodes', async (req: Request, res: Response) => {
     }
 });
 
-// No longer need OAuth endpoints - Supabase handles auth flow
-// Frontend will use Supabase signInWithOAuth({ provider: 'google' })
-
 // Create calendar events for workflow
+// SECURITY: Frontend sends Supabase access token via Authorization header
+// Backend extracts Google provider token securely from Supabase
 implementRouter.post('/workflows/:id/implement', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { access_token, start_date, daily_hours } = req.body;
+        const { start_date, daily_hours } = req.body;
 
-        if (!access_token) {
-            res.status(400).json({ success: false, error: 'Google access token required' });
+        // Extract Supabase access token from Authorization header
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            res.status(401).json({ 
+                success: false, 
+                error: 'Authorization header with Bearer token required' 
+            });
             return;
         }
+
+        const supabaseAccessToken = authHeader.replace('Bearer ', '');
 
         console.log('Received request to create calendar events');
         console.log('Workflow ID:', id);
         console.log('Start date:', start_date);
         console.log('Daily hours:', daily_hours);
 
-        const googleAccessToken = access_token;
+        // SECURITY: Get Google access token securely from Supabase session
+        // This validates the Supabase session AND retrieves the Google provider token
+        let googleAccessToken: string;
+        try {
+            googleAccessToken = await getGoogleAccessToken(supabaseAccessToken);
+        } catch (error: any) {
+            console.error('Failed to get Google access token:', error.message);
+            res.status(401).json({ 
+                success: false, 
+                error: error.message || 'Failed to authenticate with Google Calendar. Please sign in again.' 
+            });
+            return;
+        }
 
         // Get workflow edges with node data
         const { data: edges } = await getSupabase()
@@ -124,7 +142,7 @@ implementRouter.post('/workflows/:id/implement', async (req: Request, res: Respo
             daily_hours || schedule.suggestedDailyHours
         );
 
-        // Create events in Google Calendar using Google access token
+        // Create events in Google Calendar using securely obtained Google access token
         const result = await createCalendarEvents(googleAccessToken, calendarEvents);
 
         res.json({
