@@ -1,48 +1,5 @@
 import { google } from 'googleapis';
-
-function getRedirectUri(): string {
-    return process.env.GOOGLE_REDIRECT_URI || 'http://localhost:8080/api/auth/google/callback';
-}
-
-function getOAuth2Client() {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri = getRedirectUri();
-
-    if (!clientId || !clientSecret) {
-        throw new Error('Google OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env');
-    }
-
-    return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-}
-
-export function getAuthUrl(): string {
-    const redirectUri = getRedirectUri();
-
-    console.log('OAuth Config:', {
-        clientId: process.env.GOOGLE_CLIENT_ID ? 'Set (' + process.env.GOOGLE_CLIENT_ID?.substring(0, 10) + '...)' : 'NOT SET',
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET ? 'Set' : 'NOT SET',
-        redirectUri
-    });
-
-    const oauth2Client = getOAuth2Client();
-
-    return oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/calendar.events'],
-        prompt: 'consent',
-        redirect_uri: redirectUri
-    });
-}
-
-export async function getTokenFromCode(code: string) {
-    const oauth2Client = getOAuth2Client();
-    const { tokens } = await oauth2Client.getToken({
-        code,
-        redirect_uri: getRedirectUri()
-    });
-    return tokens;
-}
+import { getSupabase } from '../lib/supabase.js';
 
 export interface CalendarEvent {
     title: string;
@@ -51,12 +8,39 @@ export interface CalendarEvent {
     durationHours: number;
 }
 
+/**
+ * Get Google access token from Supabase session
+ * The user must be logged in via Supabase with Google provider
+ */
+export async function getGoogleAccessToken(supabaseAccessToken: string): Promise<string> {
+    const supabase = getSupabase();
+
+    // Get user session using the access token
+    const { data: { user }, error } = await supabase.auth.getUser(supabaseAccessToken);
+
+    if (error || !user) {
+        throw new Error('Invalid Supabase session');
+    }
+
+    // Get Google provider token from user metadata
+    const providerToken = user.app_metadata?.provider_token ||
+                         user.user_metadata?.provider_token;
+
+    if (!providerToken) {
+        throw new Error('Google provider token not found. User must sign in with Google provider.');
+    }
+
+    return providerToken;
+}
+
 export async function createCalendarEvents(
-    accessToken: string,
+    googleAccessToken: string,
     events: CalendarEvent[]
 ): Promise<{ success: boolean; eventIds: string[] }> {
-    const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({ access_token: accessToken });
+    // Create OAuth2 client with just the access token
+    const oauth2Client = new google.auth.OAuth2();
+    oauth2Client.setCredentials({ access_token: googleAccessToken });
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
     const eventIds: string[] = [];

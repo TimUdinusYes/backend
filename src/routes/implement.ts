@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { getSupabase } from '../lib/supabase.js';
 import { estimateWorkflowTime } from '../services/aiValidation.js';
-import { getAuthUrl, getTokenFromCode, createCalendarEvents, generateLearningSchedule } from '../services/googleCalendar.js';
+import { getGoogleAccessToken, createCalendarEvents, generateLearningSchedule } from '../services/googleCalendar.js';
 
 export const implementRouter = Router();
 
@@ -70,48 +70,22 @@ implementRouter.post('/estimate-nodes', async (req: Request, res: Response) => {
     }
 });
 
-// Get Google OAuth URL
-implementRouter.get('/auth/google/url', (req: Request, res: Response) => {
-    try {
-        const url = getAuthUrl();
-        res.json({ success: true, url });
-    } catch (error) {
-        console.error('OAuth URL error:', error);
-        res.status(500).json({ success: false, error: 'Google OAuth not configured' });
-    }
-});
-
-// Google OAuth callback
-implementRouter.get('/auth/google/callback', async (req: Request, res: Response) => {
-    try {
-        const { code } = req.query;
-
-        if (!code || typeof code !== 'string') {
-            res.status(400).json({ success: false, error: 'Missing code' });
-            return;
-        }
-
-        const tokens = await getTokenFromCode(code);
-
-        // Redirect back to frontend with token
-        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-        res.redirect(`${frontendUrl}/n8n-workflow?google_token=${tokens.access_token}`);
-    } catch (error) {
-        console.error('OAuth callback error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get token' });
-    }
-});
+// No longer need OAuth endpoints - Supabase handles auth flow
+// Frontend will use Supabase signInWithOAuth({ provider: 'google' })
 
 // Create calendar events for workflow
 implementRouter.post('/workflows/:id/implement', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { access_token, start_date, daily_hours } = req.body;
+        const { supabase_token, start_date, daily_hours } = req.body;
 
-        if (!access_token) {
-            res.status(400).json({ success: false, error: 'Google access token required' });
+        if (!supabase_token) {
+            res.status(400).json({ success: false, error: 'Supabase access token required' });
             return;
         }
+
+        // Get Google access token from Supabase session
+        const googleAccessToken = await getGoogleAccessToken(supabase_token);
 
         // Get workflow edges with node data
         const { data: edges } = await getSupabase()
@@ -146,8 +120,8 @@ implementRouter.post('/workflows/:id/implement', async (req: Request, res: Respo
             daily_hours || schedule.suggestedDailyHours
         );
 
-        // Create events in Google Calendar
-        const result = await createCalendarEvents(access_token, calendarEvents);
+        // Create events in Google Calendar using Google access token
+        const result = await createCalendarEvents(googleAccessToken, calendarEvents);
 
         res.json({
             success: true,
@@ -159,6 +133,7 @@ implementRouter.post('/workflows/:id/implement', async (req: Request, res: Respo
         });
     } catch (error) {
         console.error('Implement error:', error);
-        res.status(500).json({ success: false, error: 'Failed to create calendar events' });
+        const errorMessage = error instanceof Error ? error.message : 'Failed to create calendar events';
+        res.status(500).json({ success: false, error: errorMessage });
     }
 });
